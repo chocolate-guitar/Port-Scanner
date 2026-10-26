@@ -16,6 +16,7 @@ class PortStatus(Enum):
     OPEN = "open"
     CLOSED = "closed"
     FILTERED = "filtered"
+    ERROR = "error"
 
 
 @dataclass
@@ -44,22 +45,24 @@ class ScanReport:
     Attributes:
         target: The original target string (IP or hostname).
         resolved_ip: The resolved IPv4/IPv6 address.
-        port_range: Tuple of (start_port, end_port) inclusive.
+        ports: The sorted list of port numbers that were scanned.
         start_time: When the scan began.
-        end_time: When the scan finished.
+        end_time: When the scan finished (None if still running).
         results: List of individual port results.
         scan_type: The type of scan performed (e.g., 'TCP Connect').
         threads: Number of concurrent threads used.
+        interrupted: True if the scan was cut short by KeyboardInterrupt.
     """
 
     target: str
     resolved_ip: str
-    port_range: tuple[int, int]
+    ports: list[int]
     start_time: datetime = field(default_factory=datetime.now)
     end_time: Optional[datetime] = None
     results: list[PortResult] = field(default_factory=list)
     scan_type: str = "TCP Connect"
     threads: int = 100
+    interrupted: bool = False
 
     @property
     def open_ports(self) -> list[PortResult]:
@@ -77,6 +80,11 @@ class ScanReport:
         return [r for r in self.results if r.status == PortStatus.FILTERED]
 
     @property
+    def error_ports(self) -> list[PortResult]:
+        """Return only results with ERROR status."""
+        return [r for r in self.results if r.status == PortStatus.ERROR]
+
+    @property
     def duration_seconds(self) -> float:
         """Total scan duration in seconds."""
         if self.end_time is None:
@@ -85,5 +93,5 @@ class ScanReport:
 
     @property
     def total_ports(self) -> int:
-        """Total number of ports in the scan range."""
-        return self.port_range[1] - self.port_range[0] + 1
+        """Total number of ports in the scan list."""
+        return len(self.ports)

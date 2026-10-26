@@ -6,13 +6,57 @@ concurrent.futures.ThreadPoolExecutor. Each port is probed independently,
 and results are reported in real-time via a callback mechanism.
 """
 
+import errno
 import socket
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Callable, Optional
 
 from .models import PortResult, PortStatus, ScanReport
+
+# ── errno sets for status classification ─────────────────────────────────────
+# Build these once at import time so we never crash on platforms that lack
+# certain constants (Windows uses WSAE* codes; Linux/macOS use POSIX codes).
+
+def _errno_set(*names: str, fallbacks: tuple[int, ...] = ()) -> frozenset[int]:
+    """Collect errno values by name, ignoring names absent on this platform."""
+    values: set[int] = set(fallbacks)
+    for name in names:
+        v = getattr(errno, name, None)
+        if v is not None:
+            values.add(v)
+    return frozenset(values)
+
+
+# connect_ex returns 0 on success; anything else is an error code.
+_REFUSED_ERRNOS: frozenset[int] = _errno_set(
+    "ECONNREFUSED",
+    # Windows: WSAECONNREFUSED = 10061
+    fallbacks=(10061,),
+)
+
+_FILTERED_ERRNOS: frozenset[int] = _errno_set(
+    "ETIMEDOUT",    # macOS: 60  Linux: 110  — also returned by connect_ex on timeout
+    "EAGAIN",       # macOS returns 35 (EAGAIN/EWOULDBLOCK) for connect_ex timeouts
+    "EWOULDBLOCK",  # same value as EAGAIN on most POSIX systems
+    "EHOSTUNREACH",
+    "ENETUNREACH",
+    "EHOSTDOWN",
+    # Windows equivalents
+    fallbacks=(
+        10060,  # WSAETIMEDOUT
+        10065,  # WSAEHOSTUNREACH
+        10051,  # WSAENETUNREACH
+        10064,  # WSAEHOSTDOWN
+    ),
+)
+
+_RESOURCE_ERRNOS: frozenset[int] = _errno_set(
+    "EMFILE",   # too many open file descriptors (process limit)
+    "ENFILE",   # too many open files (system limit)
+)
 
 # Common port-to-service mapping for well-known ports
 WELL_KNOWN_SERVICES: dict[int, str] = {
@@ -127,6 +171,38 @@ def grab_banner(sock: socket.socket, timeout: float = 2.0) -> str:
         return ""
 
 
+def _do_connect(target_ip: str, port: int, timeout: float) -> tuple[int, Optional[socket.socket]]:
+    """Open a TCP socket and attempt a connection.
+
+    Returns the connect_ex result code and the open socket on success,
+    or a non-zero code and None on any other outcome.
+    The caller is responsible for closing the socket.
+
+    Args:
+        target_ip: The resolved IP address to connect to.
+        port: The port number to probe.
+        timeout: Connection timeout in seconds.
+
+    Returns:
+        A tuple of (result_code, socket_or_None).
+
+    Raises:
+        OSError: For resource-limit errors (EMFILE/ENFILE) so the caller
+            can catch them separately.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        rc = sock.connect_ex((target_ip, port))
+        if rc == 0:
+            return rc, sock
+        sock.close()
+        return rc, None
+    except OSError:
+        sock.close()
+        raise
+
+
 def scan_port(
     target_ip: str,
     port: int,
@@ -135,10 +211,18 @@ def scan_port(
 ) -> PortResult:
     """Scan a single port using TCP Connect method.
 
-    Creates a full TCP three-way handshake to determine port status:
-      - OPEN:     Connection succeeds (SYN → SYN-ACK → ACK).
-      - CLOSED:   Connection refused (RST received).
-      - FILTERED: Connection times out (no response, likely firewalled).
+    Maps connect_ex return codes to port statuses explicitly:
+
+    * ``0``                           → :attr:`~PortStatus.OPEN`
+    * ``ECONNREFUSED`` (61 / 10061)   → :attr:`~PortStatus.CLOSED`
+    * ``EAGAIN / ETIMEDOUT / ...``    → :attr:`~PortStatus.FILTERED`
+    * ``EMFILE / ENFILE``             → retry once; if still failing
+                                         → :attr:`~PortStatus.ERROR`
+
+    This avoids the bug where ``connect_ex`` returns a non-zero errno for
+    a *timeout* (e.g. ``EAGAIN=35`` on macOS) and the old code mapped all
+    non-zero codes to CLOSED.  The ``except socket.timeout`` branch never
+    fires when using ``connect_ex``; it only fires with ``connect()``.
 
     Args:
         target_ip: The resolved IP address to scan.
@@ -147,129 +231,177 @@ def scan_port(
         grab_banners: Whether to attempt banner grabbing on open ports.
 
     Returns:
-        A PortResult with the determined status and metadata.
+        A :class:`PortResult` with the determined status and metadata.
     """
     service = get_service_name(port)
     start = time.perf_counter()
 
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(timeout)
-            result_code = sock.connect_ex((target_ip, port))
-            elapsed_ms = (time.perf_counter() - start) * 1000
+    def _attempt() -> PortResult:
+        """Single connection attempt; raises OSError on resource exhaustion."""
+        rc, sock = _do_connect(target_ip, port, timeout)
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
 
-            if result_code == 0:
-                banner = ""
-                if grab_banners:
-                    banner = grab_banner(sock)
-                return PortResult(
-                    port=port,
-                    status=PortStatus.OPEN,
-                    service=service,
-                    banner=banner,
-                    response_time_ms=round(elapsed_ms, 2),
-                )
-            else:
-                return PortResult(
-                    port=port,
-                    status=PortStatus.CLOSED,
-                    service=service,
-                    response_time_ms=round(elapsed_ms, 2),
-                )
+        if rc == 0:
+            # Port is OPEN — optionally grab banner
+            banner = ""
+            if grab_banners and sock is not None:
+                banner = grab_banner(sock)
+            if sock is not None:
+                sock.close()
+            return PortResult(
+                port=port,
+                status=PortStatus.OPEN,
+                service=service,
+                banner=banner,
+                response_time_ms=elapsed_ms,
+            )
 
-    except socket.timeout:
-        elapsed_ms = (time.perf_counter() - start) * 1000
+        if rc in _REFUSED_ERRNOS:
+            return PortResult(
+                port=port,
+                status=PortStatus.CLOSED,
+                service=service,
+                response_time_ms=elapsed_ms,
+            )
+
+        if rc in _FILTERED_ERRNOS:
+            return PortResult(
+                port=port,
+                status=PortStatus.FILTERED,
+                service=service,
+                response_time_ms=elapsed_ms,
+            )
+
+        # Unknown non-zero code — treat as filtered (firewalled / OS-specific)
         return PortResult(
             port=port,
             status=PortStatus.FILTERED,
             service=service,
-            response_time_ms=round(elapsed_ms, 2),
+            response_time_ms=elapsed_ms,
         )
-    except OSError:
-        elapsed_ms = (time.perf_counter() - start) * 1000
+
+    try:
+        return _attempt()
+    except OSError as exc:
+        if exc.errno in _RESOURCE_ERRNOS:
+            # Too many open files — give the OS a moment and retry once.
+            time.sleep(0.1)
+            try:
+                return _attempt()
+            except OSError as exc2:
+                if exc2.errno in _RESOURCE_ERRNOS:
+                    elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+                    return PortResult(
+                        port=port,
+                        status=PortStatus.ERROR,
+                        service=service,
+                        response_time_ms=elapsed_ms,
+                    )
+                # Second attempt failed for a different reason — treat as filtered
+                elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+                return PortResult(
+                    port=port,
+                    status=PortStatus.FILTERED,
+                    service=service,
+                    response_time_ms=elapsed_ms,
+                )
+        # Non-resource OSError (e.g. network unreachable at socket level)
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
         return PortResult(
             port=port,
             status=PortStatus.FILTERED,
             service=service,
-            response_time_ms=round(elapsed_ms, 2),
+            response_time_ms=elapsed_ms,
         )
 
 
 def run_scan(
     target: str,
-    start_port: int = 1,
-    end_port: int = 1024,
+    ports: list[int],
     threads: int = 200,
     timeout: float = 1.5,
     grab_banners: bool = False,
     on_result: Optional[Callable[[PortResult, int, int], None]] = None,
     show_all: bool = False,
 ) -> ScanReport:
-    """Execute a full port scan across the specified range.
+    """Execute a full port scan across the given list of ports.
 
     Distributes port scanning work across a thread pool for concurrent
-    execution. Results are reported in real-time via the on_result callback.
+    execution. Results are reported in real-time via the *on_result* callback.
+
+    The *target* parameter must already be a resolved IP address (the caller
+    is responsible for DNS resolution so it happens exactly once).
+
+    On :exc:`KeyboardInterrupt`, the executor is shut down immediately
+    (``cancel_futures=True``) and a partial :class:`ScanReport` is returned
+    with ``interrupted=True``.
 
     Args:
-        target: Hostname or IP address to scan.
-        start_port: First port in the scan range (inclusive).
-        end_port: Last port in the scan range (inclusive).
+        target: The already-resolved IP address to scan.
+        ports: Sorted list of port numbers to probe.
         threads: Maximum number of concurrent scanning threads.
         timeout: Per-port connection timeout in seconds.
         grab_banners: Whether to attempt banner grabbing on open ports.
         on_result: Callback invoked for each completed port scan.
-                   Receives (result, completed_count, total_count).
-        show_all: If True, report all ports. If False, only open/filtered.
+                   Receives ``(result, completed_count, total_count)``.
+        show_all: If True, store all port results. If False, only
+                  open, filtered, and error results are stored.
 
     Returns:
-        A completed ScanReport with all results.
-
-    Raises:
-        socket.gaierror: If the target hostname cannot be resolved.
-        ValueError: If port range is invalid.
+        A :class:`ScanReport` (possibly partial if interrupted).
     """
-    if start_port < 1 or end_port > 65535 or start_port > end_port:
-        raise ValueError(
-            f"Invalid port range: {start_port}-{end_port}. "
-            f"Must be between 1 and 65535 with start <= end."
-        )
-
-    resolved_ip = resolve_target(target)
-    ports = range(start_port, end_port + 1)
     total = len(ports)
 
     report = ScanReport(
         target=target,
-        resolved_ip=resolved_ip,
-        port_range=(start_port, end_port),
+        resolved_ip=target,
+        ports=ports,
         start_time=datetime.now(),
         threads=threads,
     )
 
     completed = 0
-
-    with ThreadPoolExecutor(max_workers=threads) as executor:
-        # Submit all port scan tasks
+    executor = ThreadPoolExecutor(max_workers=threads)
+    try:
         future_to_port = {
-            executor.submit(scan_port, resolved_ip, port, timeout, grab_banners): port
+            executor.submit(scan_port, target, port, timeout, grab_banners): port
             for port in ports
         }
 
-        # Collect results as they complete
         for future in as_completed(future_to_port):
             result = future.result()
             completed += 1
 
-            # Always store open and filtered; store closed only if show_all
-            if result.status in (PortStatus.OPEN, PortStatus.FILTERED) or show_all:
+            # Always keep OPEN, FILTERED, ERROR; CLOSED only when show_all
+            if result.status in (PortStatus.OPEN, PortStatus.FILTERED, PortStatus.ERROR) or show_all:
                 report.results.append(result)
 
             if on_result is not None:
                 on_result(result, completed, total)
 
+    except KeyboardInterrupt:
+        # Shut down immediately — don't wait for queued futures
+        executor.shutdown(wait=False, cancel_futures=True)
+        report.interrupted = True
+        report.end_time = datetime.now()
+        report.results.sort(key=lambda r: r.port)
+        return report
+    else:
+        executor.shutdown(wait=False)
+
     report.end_time = datetime.now()
 
     # Sort results by port number for clean output
     report.results.sort(key=lambda r: r.port)
+
+    # Warn about resource errors so the user knows to lower --threads
+    error_count = len(report.error_ports)
+    if error_count:
+        print(
+            f"\n  ⚠ WARNING: {error_count} port(s) returned ERROR (EMFILE/ENFILE — "
+            f"too many open files). Consider a lower --threads value or raising "
+            f"your ulimit (e.g. `ulimit -n 4096`).",
+            file=sys.stderr,
+        )
 
     return report

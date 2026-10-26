@@ -84,6 +84,7 @@ def _status_color(status: PortStatus) -> str:
         PortStatus.OPEN: Colors.BRIGHT_GREEN,
         PortStatus.CLOSED: Colors.GREY,
         PortStatus.FILTERED: Colors.BRIGHT_YELLOW,
+        PortStatus.ERROR: Colors.BRIGHT_RED,
     }.get(status, Colors.RESET)
 
 
@@ -93,6 +94,7 @@ def _status_icon(status: PortStatus) -> str:
         PortStatus.OPEN: "●",
         PortStatus.CLOSED: "○",
         PortStatus.FILTERED: "◐",
+        PortStatus.ERROR: "✖",
     }.get(status, "?")
 
 
@@ -128,14 +130,39 @@ def print_banner() -> None:
 def print_scan_config(
     target: str,
     resolved_ip: str,
-    port_range: tuple[int, int],
+    ports: list[int],
     threads: int,
     timeout: float,
     scan_type: str = "TCP Connect",
 ) -> None:
-    """Print the scan configuration summary before scanning begins."""
+    """Print the scan configuration summary before scanning begins.
+
+    Args:
+        target: The original target string entered by the user.
+        resolved_ip: The resolved IP address.
+        ports: The sorted list of ports to be scanned.
+        threads: Number of concurrent threads.
+        timeout: Per-port connection timeout in seconds.
+        scan_type: Human-readable scan type label.
+    """
     width = min(_get_terminal_width(), 90)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Build a compact port range description
+    total = len(ports)
+    port_min, port_max = ports[0], ports[-1]
+    if port_max - port_min + 1 == total:
+        # Contiguous range
+        port_desc = (
+            f"{Colors.BRIGHT_WHITE}{port_min}{Colors.RESET}"
+            f" – {Colors.BRIGHT_WHITE}{port_max}{Colors.RESET}"
+            f"  ({total:,} ports)"
+        )
+    else:
+        port_desc = (
+            f"{Colors.BRIGHT_WHITE}{total:,} ports{Colors.RESET}"
+            f"  (range: {port_min}–{port_max})"
+        )
 
     print(f"  {Colors.BRIGHT_CYAN}{Colors.BOLD}┌{'─' * (width - 4)}┐{Colors.RESET}")
     print(f"  {Colors.BRIGHT_CYAN}{Colors.BOLD}│{Colors.RESET}  {Colors.BOLD}SCAN CONFIGURATION{' ' * (width - 24)}{Colors.BRIGHT_CYAN}{Colors.BOLD}│{Colors.RESET}")
@@ -143,7 +170,7 @@ def print_scan_config(
 
     rows = [
         ("Target", f"{target} → {Colors.BRIGHT_WHITE}{resolved_ip}{Colors.RESET}"),
-        ("Port Range", f"{Colors.BRIGHT_WHITE}{port_range[0]}{Colors.RESET} – {Colors.BRIGHT_WHITE}{port_range[1]}{Colors.RESET}  ({port_range[1] - port_range[0] + 1:,} ports)"),
+        ("Port Range", port_desc),
         ("Scan Type", f"{Colors.BRIGHT_MAGENTA}{scan_type}{Colors.RESET}"),
         ("Threads", f"{Colors.BRIGHT_WHITE}{threads}{Colors.RESET}"),
         ("Timeout", f"{Colors.BRIGHT_WHITE}{timeout}s{Colors.RESET}"),
@@ -221,20 +248,31 @@ def print_results_summary(report: ScanReport) -> None:
 
     print()
     print(f"  {Colors.BRIGHT_CYAN}{Colors.BOLD}{'═' * (width - 4)}{Colors.RESET}")
-    print(f"  {Colors.BOLD}{Colors.BRIGHT_WHITE}  SCAN RESULTS SUMMARY{Colors.RESET}")
+    print(f"  {Colors.BOLD}{Colors.BRIGHT_WHITE}  SCAN RESULTS SUMMARY{Colors.RESET}", end="")
+    if report.interrupted:
+        print(
+            f"  {Colors.BRIGHT_YELLOW}⚠  PARTIAL — scan was interrupted{Colors.RESET}",
+            end="",
+        )
+    print()
     print(f"  {Colors.BRIGHT_CYAN}{Colors.BOLD}{'═' * (width - 4)}{Colors.RESET}")
     print()
 
     # Summary statistics
-    open_count = len(report.open_ports)
-    closed_count = len(report.closed_ports)
+    open_count     = len(report.open_ports)
     filtered_count = len(report.filtered_ports)
-    total_scanned = report.total_ports
+    error_count    = len(report.error_ports)
+    total_scanned  = report.total_ports
+    # Closed = total not accounted for by open/filtered/error results
+    # (closed ports may not be stored when show_all=False)
+    closed_count   = total_scanned - open_count - filtered_count - error_count
 
     print(f"  {Colors.BOLD}Statistics:{Colors.RESET}")
     print(f"    {Colors.BRIGHT_GREEN}● Open:     {open_count:>6,}{Colors.RESET}")
-    print(f"    {Colors.GREY}○ Closed:   {total_scanned - open_count - filtered_count:>6,}{Colors.RESET}")
+    print(f"    {Colors.GREY}○ Closed:   {closed_count:>6,}{Colors.RESET}")
     print(f"    {Colors.BRIGHT_YELLOW}◐ Filtered: {filtered_count:>6,}{Colors.RESET}")
+    if error_count:
+        print(f"    {Colors.BRIGHT_RED}✖ Error:    {error_count:>6,}{Colors.RESET}")
     print(f"    {Colors.BRIGHT_WHITE}  Total:    {total_scanned:>6,}{Colors.RESET}")
     print()
 
@@ -272,6 +310,16 @@ def print_results_summary(report: ScanReport) -> None:
         if len(report.filtered_ports) > 20:
             print(f" {Colors.DIM}… and {len(report.filtered_ports) - 20} more{Colors.RESET}", end="")
         print()
+
+    # Error ports warning (if any)
+    if report.error_ports:
+        print()
+        print(
+            f"  {Colors.BRIGHT_RED}{Colors.BOLD}  ✖ {error_count} port(s) returned ERROR{Colors.RESET}"
+            f" — likely EMFILE/ENFILE (too many open files).\n"
+            f"    Try a lower --threads value or raise your ulimit "
+            f"(e.g. {Colors.DIM}`ulimit -n 4096`{Colors.RESET})."
+        )
 
     print()
 

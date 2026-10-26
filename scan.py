@@ -9,17 +9,15 @@ Usage:
     python scan.py <target> [options]
 
 Examples:
-    python scan.py 192.168.1.1
-    python scan.py scanme.nmap.org -p 1-1024 -t 300
-    python scan.py example.com -p 80,443,8080
-    python scan.py 10.0.0.1 -p 1-65535 --timeout 2.0 --banner
+    python scan.py 127.0.0.1
+    python scan.py 127.0.0.1 -p 1-1024 -t 300
+    python scan.py 127.0.0.1 -p 80,443,8080
+    python scan.py 127.0.0.1 -p web --banner
 """
 
 import argparse
-import signal
 import socket
 import sys
-from typing import NoReturn
 
 from portscanner import __version__
 from portscanner.display import (
@@ -34,86 +32,57 @@ from portscanner.display import (
 )
 from portscanner.models import PortResult
 from portscanner.scanner import resolve_target, run_scan
+from portscanner.targets import parse_ports
 
 
-def parse_port_range(port_string: str) -> tuple[int, int]:
-    """Parse a port range specification string.
-
-    Supports formats:
-        - Single port:   "80"       → (80, 80)
-        - Range:         "1-1024"   → (1, 1024)
-        - Comma list:    "80,443"   → handled by returning min/max
-        - Named ranges:  "common"   → predefined ranges
+def _validate_threads(value: str) -> int:
+    """Validate that --threads is a positive integer.
 
     Args:
-        port_string: The port specification string from CLI.
+        value: The raw string value from argparse.
 
     Returns:
-        A tuple of (start_port, end_port).
+        The validated integer thread count.
 
     Raises:
-        argparse.ArgumentTypeError: If the port spec is invalid.
+        argparse.ArgumentTypeError: If the value is not a positive integer.
     """
-    # Named presets
-    presets = {
-        "common": (1, 1024),
-        "all": (1, 65535),
-        "web": (80, 443),
-        "top100": (1, 100),
-        "high": (1024, 65535),
-    }
-
-    lowered = port_string.strip().lower()
-    if lowered in presets:
-        return presets[lowered]
-
-    # Comma-separated list (e.g., "80,443,8080")
-    if "," in port_string:
-        try:
-            ports = [int(p.strip()) for p in port_string.split(",")]
-            for p in ports:
-                if p < 1 or p > 65535:
-                    raise argparse.ArgumentTypeError(
-                        f"Port {p} is out of range (1-65535)."
-                    )
-            return (min(ports), max(ports))
-        except ValueError:
-            raise argparse.ArgumentTypeError(
-                f"Invalid port list: '{port_string}'. Use comma-separated integers."
-            )
-
-    # Range (e.g., "1-1024")
-    if "-" in port_string:
-        parts = port_string.split("-", 1)
-        try:
-            start, end = int(parts[0].strip()), int(parts[1].strip())
-        except ValueError:
-            raise argparse.ArgumentTypeError(
-                f"Invalid port range: '{port_string}'. Use format: START-END"
-            )
-        if start < 1 or end > 65535:
-            raise argparse.ArgumentTypeError(
-                f"Port numbers must be between 1 and 65535, got {start}-{end}."
-            )
-        if start > end:
-            raise argparse.ArgumentTypeError(
-                f"Start port ({start}) cannot be greater than end port ({end})."
-            )
-        return (start, end)
-
-    # Single port
     try:
-        port = int(port_string.strip())
-        if port < 1 or port > 65535:
-            raise argparse.ArgumentTypeError(
-                f"Port {port} is out of range (1-65535)."
-            )
-        return (port, port)
+        n = int(value)
     except ValueError:
         raise argparse.ArgumentTypeError(
-            f"Invalid port specification: '{port_string}'.\n"
-            f"  Accepted formats: 80 | 1-1024 | 80,443,8080 | common | all"
+            f"--threads must be an integer, got: '{value}'."
         )
+    if n < 1:
+        raise argparse.ArgumentTypeError(
+            f"--threads must be >= 1, got: {n}."
+        )
+    return n
+
+
+def _validate_timeout(value: str) -> float:
+    """Validate that --timeout is a positive float.
+
+    Args:
+        value: The raw string value from argparse.
+
+    Returns:
+        The validated float timeout.
+
+    Raises:
+        argparse.ArgumentTypeError: If the value is not a positive number.
+    """
+    try:
+        t = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--timeout must be a number, got: '{value}'."
+        )
+    if t <= 0:
+        raise argparse.ArgumentTypeError(
+            f"--timeout must be > 0, got: {t}."
+        )
+    return t
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -130,10 +99,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             f"{Colors.DIM}Examples:\n"
-            f"  python scan.py scanme.nmap.org\n"
-            f"  python scan.py 192.168.1.1 -p 1-1024 -t 300\n"
-            f"  python scan.py example.com -p 80,443,8080 --banner\n"
-            f"  python scan.py 10.0.0.1 -p all --timeout 2.0{Colors.RESET}"
+            f"  python scan.py 127.0.0.1\n"
+            f"  python scan.py 127.0.0.1 -p 1-1024 -t 300\n"
+            f"  python scan.py 127.0.0.1 -p 80,443,8080 --banner\n"
+            f"  python scan.py 127.0.0.1 -p all --timeout 2.0{Colors.RESET}"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -146,29 +115,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "-p", "--ports",
-        type=str,
-        default="1-1024",
-        metavar="RANGE",
+        type=parse_ports,
+        default="common",
+        metavar="SPEC",
         help=(
-            "Port range to scan. Formats: 80 | 1-1024 | 80,443 | "
-            "common | all | web | top100 | high  (default: 1-1024)"
+            "Port spec to scan. Formats: 80 | 1-1024 | 80,443 | 1-100,443,8080-8090 | "
+            "common | all | web | top100 | high  (default: common = 1-1024)"
         ),
     )
 
     parser.add_argument(
         "-t", "--threads",
-        type=int,
+        type=_validate_threads,
         default=200,
         metavar="N",
-        help="Number of concurrent threads (default: 200).",
+        help="Number of concurrent threads, >= 1 (default: 200).",
     )
 
     parser.add_argument(
         "--timeout",
-        type=float,
+        type=_validate_timeout,
         default=1.5,
         metavar="SEC",
-        help="Per-port connection timeout in seconds (default: 1.5).",
+        help="Per-port connection timeout in seconds, > 0 (default: 1.5).",
     )
 
     parser.add_argument(
@@ -194,35 +163,22 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def handle_sigint(signum: int, frame: object) -> NoReturn:
-    """Handle Ctrl+C gracefully."""
-    print(f"\n\n  {Colors.BRIGHT_YELLOW}⚠  Scan interrupted by user (Ctrl+C).{Colors.RESET}\n")
-    sys.exit(130)
-
-
 def main() -> int:
     """Main entry point for the port scanner CLI.
 
     Returns:
-        Exit code: 0 for success, 1 for errors.
+        Exit code: 0 for success, 1 for errors, 130 for Ctrl+C.
     """
-    # Register signal handler for clean Ctrl+C
-    signal.signal(signal.SIGINT, handle_sigint)
-
     parser = build_parser()
     args = parser.parse_args()
 
     # Print banner
     print_banner()
 
-    # Parse port range
-    try:
-        start_port, end_port = parse_port_range(args.ports)
-    except argparse.ArgumentTypeError as e:
-        print_error(str(e))
-        return 1
+    # args.ports is already a list[int] — parse_ports() ran as the type converter.
+    ports: list[int] = args.ports
 
-    # Resolve hostname
+    # Resolve hostname exactly once
     try:
         resolved_ip = resolve_target(args.target)
     except socket.gaierror:
@@ -232,22 +188,21 @@ def main() -> int:
         )
         return 1
 
-    # Validate thread count
-    total_ports = end_port - start_port + 1
-    threads = min(args.threads, total_ports)  # No point having more threads than ports
+    # Cap threads to the number of ports (no point having more threads than ports)
+    threads = min(args.threads, len(ports))
 
     # Display scan configuration
     print_scan_config(
         target=args.target,
         resolved_ip=resolved_ip,
-        port_range=(start_port, end_port),
+        ports=ports,
         threads=threads,
         timeout=args.timeout,
         scan_type="TCP Connect",
     )
 
     # Ethical reminder for large scans
-    if total_ports > 10000:
+    if len(ports) > 10000:
         print_warning(
             "Scanning a large port range. Ensure you have authorization "
             "to scan this target.\n"
@@ -259,12 +214,11 @@ def main() -> int:
     def on_result(result: PortResult, completed: int, total: int) -> None:
         print_progress(completed, total, result)
 
-    # Run the scan
+    # Run the scan — KeyboardInterrupt is handled inside run_scan
     try:
         report = run_scan(
-            target=args.target,
-            start_port=start_port,
-            end_port=end_port,
+            target=resolved_ip,
+            ports=ports,
             threads=threads,
             timeout=args.timeout,
             grab_banners=args.banner,
@@ -274,14 +228,12 @@ def main() -> int:
     except ValueError as e:
         print_error(str(e))
         return 1
-    except socket.gaierror:
-        print_error(f"Failed to resolve target '{args.target}'.")
-        return 1
-    except KeyboardInterrupt:
-        handle_sigint(signal.SIGINT, None)
 
-    # Print results
+    # Print results (partial or complete)
     print_results_summary(report)
+
+    if report.interrupted:
+        return 130
 
     return 0
 
